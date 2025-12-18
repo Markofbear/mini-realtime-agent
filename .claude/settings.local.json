@@ -4,7 +4,8 @@
       "Bash(npm install:*)",
       "Bash(npm run build:*)",
       "Bash(npm start)",
-      "Bash(node --import tsx:*)"
+      "Bash(node --import tsx:*)",
+      "Bash(npm test:*)"
     ]
   }
 }

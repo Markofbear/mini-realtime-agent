@@ -28,7 +28,8 @@ export function extractNumbers(text: string): string[] {
   // - Percentages: 50%
   // - Decimals: 12.5, 12,5
   // - Integers: 123
-  const pattern = /\+?[\d][\d\s\-.,:%]*/g;
+  // Note: Use space instead of \s to avoid matching across newlines
+  const pattern = /\+?[\d][\d \-.,:%]*/g;
   const matches = text.match(pattern) || [];
 
   return matches
@@ -83,7 +84,11 @@ export function retrieveDocuments(
   documents: KBDocument[]
 ): KBDocument[] {
   const queryLower = query.toLowerCase();
-  const terms = queryLower.split(/\s+/).filter((t) => t.length > 2);
+  // Strip punctuation from terms to handle "paket?" matching "paket"
+  const terms = queryLower
+    .split(/\s+/)
+    .map((t) => t.replace(/[^a-zåäö0-9]/gi, ""))
+    .filter((t) => t.length > 2);
 
   if (terms.length === 0) {
     return [];
@@ -91,7 +96,22 @@ export function retrieveDocuments(
 
   return documents.filter((doc) => {
     const contentLower = doc.content.toLowerCase();
-    return terms.some((term) => contentLower.includes(term));
+    // Extract words from content for prefix matching
+    const contentWords = contentLower.match(/[a-zåäö]+/gi) || [];
+
+    return terms.some((term) => {
+      // Direct substring match
+      if (contentLower.includes(term)) {
+        return true;
+      }
+      // Check if any content word is a prefix of the term
+      // This handles inflected forms like "paketen" matching "paket"
+      // or "kundtjänstens" matching "kundtjänst"
+      // Require word length > 3 to avoid false matches like "com" matching "completely"
+      return contentWords.some(
+        (word) => word.length > 3 && term.startsWith(word)
+      );
+    });
   });
 }
 
