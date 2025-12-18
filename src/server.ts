@@ -4,6 +4,8 @@ import { verifyGrounding, Citation } from "./grounding";
 
 const PORT = 8787;
 
+// --- Message Types ---
+
 interface StreamMessage {
   type: "stream";
   delta: string;
@@ -16,16 +18,61 @@ interface StreamEndMessage {
 
 interface ResponseMessage {
   type: "response";
+  text: string;
   citations: Citation[];
 }
 
-type OutgoingMessage = StreamMessage | StreamEndMessage | ResponseMessage;
+interface ActionSuggestionMessage {
+  type: "action_suggestion";
+  suggestionId: string;
+  action: string;
+  payload: Record<string, unknown>;
+}
+
+interface ActionExecutedMessage {
+  type: "action_executed";
+  suggestionId: string;
+  result: { success: boolean } | { ignored: true };
+}
+
+type OutgoingMessage =
+  | StreamMessage
+  | StreamEndMessage
+  | ResponseMessage
+  | ActionSuggestionMessage
+  | ActionExecutedMessage;
+
+// --- Action Types ---
+
+type ActionType = "schedule_callback" | "send_sms" | "create_ticket";
+
+interface PendingAction {
+  action: ActionType;
+  payload: Record<string, unknown>;
+  createdAt: number;
+}
+
+interface ExecutedAction {
+  executedAt: number;
+}
+
+// --- Connection State ---
 
 interface ConnectionState {
   abortController: AbortController | null;
+  pendingActions: Map<string, PendingAction>;
+  executedActions: Map<string, ExecutedAction>;
 }
 
 const connectionStates = new WeakMap<WebSocket, ConnectionState>();
+
+// --- Triggers (as per assignment.md) ---
+
+const ACTION_TRIGGERS: Array<{ patterns: string[]; action: ActionType }> = [
+  { patterns: ["ring mig", "ring upp"], action: "schedule_callback" },
+  { patterns: ["skicka sms", "sms:a"], action: "send_sms" },
+  { patterns: ["skapa ärende", "öppna ticket"], action: "create_ticket" },
+];
 
 // Fail-closed messages: EXACTLY as per assignment.md
 const FAIL_CLOSED_MESSAGES: Record<string, string> = {
@@ -33,10 +80,17 @@ const FAIL_CLOSED_MESSAGES: Record<string, string> = {
   ungrounded_numbers: "Jag kan inte verifiera det.",
 };
 
+// Idempotency window in milliseconds
+const IDEMPOTENCY_WINDOW_MS = 30000;
+
 function getState(ws: WebSocket): ConnectionState {
   let state = connectionStates.get(ws);
   if (!state) {
-    state = { abortController: null };
+    state = {
+      abortController: null,
+      pendingActions: new Map(),
+      executedActions: new Map(),
+    };
     connectionStates.set(ws, state);
   }
   return state;
@@ -46,6 +100,22 @@ function send(ws: WebSocket, message: OutgoingMessage): void {
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(message));
   }
+}
+
+function generateSuggestionId(): string {
+  return `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+}
+
+function detectTrigger(text: string): ActionType | null {
+  const lowerText = text.toLowerCase();
+  for (const trigger of ACTION_TRIGGERS) {
+    for (const pattern of trigger.patterns) {
+      if (lowerText.includes(pattern)) {
+        return trigger.action;
+      }
+    }
+  }
+  return null;
 }
 
 async function streamTokensToClient(
@@ -148,11 +218,75 @@ async function handleMessage(ws: WebSocket, userText: string): Promise<void> {
 
   if (streamCompleted) {
     send(ws, { type: "stream_end", reason: "done" });
-    // Send response message with citations (only when not cancelled)
-    send(ws, { type: "response", citations });
+    // Send response message with text and citations (only when not cancelled)
+    send(ws, { type: "response", text: responseToStream, citations });
+
+    // Step 5: Check for action triggers in user's original message
+    const detectedAction = detectTrigger(userText);
+    if (detectedAction) {
+      const suggestionId = generateSuggestionId();
+      const payload: Record<string, unknown> = {};
+
+      // Store pending action
+      state.pendingActions.set(suggestionId, {
+        action: detectedAction,
+        payload,
+        createdAt: Date.now(),
+      });
+
+      // Send action suggestion
+      send(ws, {
+        type: "action_suggestion",
+        suggestionId,
+        action: detectedAction,
+        payload,
+      });
+    }
   }
 
   state.abortController = null;
+}
+
+function handleConfirmAction(ws: WebSocket, suggestionId: string): void {
+  const state = getState(ws);
+  const now = Date.now();
+
+  // Check idempotency: was this already executed within 30s?
+  const executed = state.executedActions.get(suggestionId);
+  if (executed && now - executed.executedAt < IDEMPOTENCY_WINDOW_MS) {
+    // Already executed within window - ignore
+    send(ws, {
+      type: "action_executed",
+      suggestionId,
+      result: { ignored: true },
+    });
+    return;
+  }
+
+  // Check if this is a valid pending action
+  const pending = state.pendingActions.get(suggestionId);
+  if (!pending) {
+    // Unknown or expired suggestion - ignore silently
+    return;
+  }
+
+  // Execute the action (mock execution)
+  state.pendingActions.delete(suggestionId);
+  state.executedActions.set(suggestionId, { executedAt: now });
+
+  // Clean up old executed actions (older than 30s)
+  for (const [id, exec] of state.executedActions) {
+    if (now - exec.executedAt >= IDEMPOTENCY_WINDOW_MS) {
+      state.executedActions.delete(id);
+    }
+  }
+
+  // Send action executed confirmation
+  send(ws, {
+    type: "action_executed",
+    suggestionId,
+    result: { success: true },
+  });
 }
 
 function handleCancel(ws: WebSocket): void {
@@ -161,7 +295,7 @@ function handleCancel(ws: WebSocket): void {
   if (state.abortController) {
     state.abortController.abort();
     state.abortController = null;
-    // Cancel: send stream_end cancelled and do NOTHING else (no response message)
+    // Cancel: send stream_end cancelled and do NOTHING else (no response, no action_suggestion)
     send(ws, { type: "stream_end", reason: "cancelled" });
   }
 }
@@ -186,6 +320,8 @@ function startServer(): WebSocketServer {
         handleMessage(ws, msg.text);
       } else if (msg.type === "cancel") {
         handleCancel(ws);
+      } else if (msg.type === "confirm_action" && typeof msg.suggestionId === "string") {
+        handleConfirmAction(ws, msg.suggestionId);
       }
     });
 
