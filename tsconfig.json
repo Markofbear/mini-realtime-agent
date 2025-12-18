@@ -33,6 +33,6 @@
     "moduleDetection": "force",
     "skipLibCheck": true,
   },
-  "include": ["src/**/*"],
+  "include": ["src/**/*", "tests/grounding.test.ts"],
   "exclude": ["node_modules", "dist"]
 }
