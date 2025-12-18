@@ -1,4 +1,6 @@
 import { WebSocketServer, WebSocket } from "ws";
+import { streamResponse } from "../mock_llm";
+import { verifyGrounding, Citation } from "./grounding";
 
 const PORT = 8787;
 
@@ -12,13 +14,24 @@ interface StreamEndMessage {
   reason: "done" | "cancelled";
 }
 
-type OutgoingMessage = StreamMessage | StreamEndMessage;
+interface ResponseMessage {
+  type: "response";
+  citations: Citation[];
+}
+
+type OutgoingMessage = StreamMessage | StreamEndMessage | ResponseMessage;
 
 interface ConnectionState {
   abortController: AbortController | null;
 }
 
 const connectionStates = new WeakMap<WebSocket, ConnectionState>();
+
+// Fail-closed messages: EXACTLY as per assignment.md
+const FAIL_CLOSED_MESSAGES: Record<string, string> = {
+  no_sources: "Jag hittar inget stöd i kunskapsbasen.",
+  ungrounded_numbers: "Jag kan inte verifiera det.",
+};
 
 function getState(ws: WebSocket): ConnectionState {
   let state = connectionStates.get(ws);
@@ -35,7 +48,7 @@ function send(ws: WebSocket, message: OutgoingMessage): void {
   }
 }
 
-async function streamTokens(
+async function streamTokensToClient(
   ws: WebSocket,
   text: string,
   signal: AbortSignal
@@ -69,9 +82,10 @@ async function streamTokens(
   return true;
 }
 
-async function handleMessage(ws: WebSocket, text: string): Promise<void> {
+async function handleMessage(ws: WebSocket, userText: string): Promise<void> {
   const state = getState(ws);
 
+  // Abort any existing stream
   if (state.abortController) {
     state.abortController.abort();
   }
@@ -79,11 +93,63 @@ async function handleMessage(ws: WebSocket, text: string): Promise<void> {
   state.abortController = new AbortController();
   const signal = state.abortController.signal;
 
-  const echoText = `You said: "${text}"`;
-  const completed = await streamTokens(ws, echoText, signal);
+  // Step 1: Buffer ALL LLM output before streaming anything to client
+  const tokens: string[] = [];
+  await streamResponse(
+    userText,
+    (token) => {
+      tokens.push(token);
+    },
+    { signal }
+  );
 
-  if (completed) {
+  // Cancel overrides everything: if cancelled, do NOTHING
+  if (signal.aborted) {
+    state.abortController = null;
+    return;
+  }
+
+  const bufferedResponse = tokens.join("");
+
+  // Step 2: Run grounding verification on the full buffered response
+  const groundingResult = verifyGrounding(userText, bufferedResponse);
+
+  // Cancel overrides everything: if cancelled during grounding, do NOTHING
+  if (signal.aborted) {
+    state.abortController = null;
+    return;
+  }
+
+  // Step 3: Determine what to stream and citations
+  let responseToStream: string;
+  let citations: Citation[];
+
+  if (groundingResult.grounded) {
+    responseToStream = bufferedResponse;
+    citations = groundingResult.citations;
+  } else if (groundingResult.failReason === "no_sources") {
+    // No sources: empty citations
+    responseToStream = FAIL_CLOSED_MESSAGES.no_sources;
+    citations = [];
+  } else {
+    // Ungrounded numbers: show top hits (without the ungrounded number)
+    responseToStream = FAIL_CLOSED_MESSAGES.ungrounded_numbers;
+    citations = groundingResult.citations;
+  }
+
+  // Step 4: Stream verified content to client
+  const streamCompleted = await streamTokensToClient(ws, responseToStream, signal);
+
+  // Cancel overrides everything: if cancelled during streaming, do NOTHING
+  if (signal.aborted) {
+    state.abortController = null;
+    return;
+  }
+
+  if (streamCompleted) {
     send(ws, { type: "stream_end", reason: "done" });
+    // Send response message with citations (only when not cancelled)
+    send(ws, { type: "response", citations });
   }
 
   state.abortController = null;
@@ -95,6 +161,7 @@ function handleCancel(ws: WebSocket): void {
   if (state.abortController) {
     state.abortController.abort();
     state.abortController = null;
+    // Cancel: send stream_end cancelled and do NOTHING else (no response message)
     send(ws, { type: "stream_end", reason: "cancelled" });
   }
 }
