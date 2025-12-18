@@ -8,7 +8,9 @@
       "Bash(npm test:*)",
       "Bash(ls:*)",
       "Bash(find:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nPrepare repository for final submission\n\n- Add README.md with how to run + design decisions\n- Add DECISIONS.md with 5 rejected alternatives \\(moved to root\\)\n- Add ABOUT_ME.md with personal introduction\n- Populate .claude/CLAUDE.md with project instructions\n- Remove build artifacts \\(dist/, compiled JS, .d.ts, .map files\\)\n- Add session-2.cast recording\n\n🤖 Generated with [Claude Code]\\(https://claude.com/claude-code\\)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git config:*)"
     ]
   }
 }
